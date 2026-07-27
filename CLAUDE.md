@@ -29,8 +29,14 @@ no gameplay, no open world. If a request expands beyond that, push back
 before writing code.
 
 ### 3. Performance budget
-18 GB unified memory, integrated GPU. Target 60fps at 1440p.
-Keep draw calls under 50. Cap device pixel ratio at 2.
+- Target 60fps at 4K (3840x2160) on Apple M3 Pro.
+- Keep draw calls under 50.
+- Post-processing passes render at half resolution, then upscale.
+- All heavy effects sit behind a quality preset system (low / medium / ultra)
+  with automatic hardware detection.
+
+Every future feature must be checked against these targets before it is
+considered done.
 
 ### 4. Historical accuracy is the pitch
 Samarra was real. If unsure about a historical detail, flag it as needing
