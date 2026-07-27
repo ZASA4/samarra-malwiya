@@ -1,0 +1,5 @@
+# Dependencies — reinstalled from package.json, never committed
+node_modules
+
+# Vite build output
+dist

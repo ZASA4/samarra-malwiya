@@ -10,7 +10,7 @@ This is a portfolio project. Its purpose is to demonstrate real engineering
 skill to hiring managers.
 
 **Stack:** Three.js + Vite (vanilla JavaScript, no framework)
-**Target:** Web browser, deployed on Vercel
+**Target:** Web browser, deployed on GitHub Pages at https://zasa4.github.io/samarra-malwiya/
 **Team size:** 1 junior developer
 **Hardware:** MacBook Pro M3 Pro, 18 GB unified memory
 
