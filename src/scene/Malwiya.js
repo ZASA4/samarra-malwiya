@@ -42,15 +42,14 @@ export default class Malwiya extends THREE.Group {
         towerRadialSegments: 48, // faces around
         courseHeight: 0.65, // m per brick course -> drives vertical resolution
 
-        // Helical ramp
+        // Helical ramp (one drum per turn — the ramp IS the structure)
         rampTurns: 5,
-        rampWidth: 2.3, // m
+        rampWidth: 2.3, // m, at the base
         rampThickness: 0.5, // m, slab depth
-        parapetHeight: 0.9, // m, outer wall above the walking surface
-        parapetThickness: 0.35, // m
+        rampNarrow: 0.18, // 0..1, how much the ramp narrows from base to top
         segmentsPerTurn: 100, // sweep resolution
         handedness: -1, // -1 = counter-clockwise viewed from above
-        edgeChamfer: 0.12, // m, corner rounding on the ramp cross-section
+        edgeChamfer: 0.07, // m, corner rounding (small — fired brick has hard edges)
 
         // Summit chamber
         chamberRadius: 3.2, // m
@@ -59,7 +58,7 @@ export default class Malwiya extends THREE.Group {
 
         // Erosion (MESO)
         courseRelief: 0.06, // m, how far course displacement pushes
-        slumpAmount: 0.6, // m, outward bulge at the very base
+        slumpAmount: 0.15, // m, slight base bulge only (fired brick barely slumps)
         missingBrickChance: 0.02, // 0..1 probability per candidate cell
         brickDepth: 0.18, // m, how deep a missing brick recesses
 
@@ -74,14 +73,15 @@ export default class Malwiya extends THREE.Group {
         brickTexH: 0.22, // m, course height in the texture pattern
         mortarWidth: 0.09, // fraction of a brick taken by mortar
         cavityDark: 0.5, // dirt darkening in the mortar lines
-        edgeWear: 0.5, // brightening/smoothing of worn brick edges
+        edgeWear: 0.3, // brightening/smoothing of worn edges (fired = harder edges)
         grainScale: 6.0, // frequency of the fine grain noise
         polish: 0.5, // roughness multiplier on trodden (up-facing) surfaces
-        brickColorA: '#6f5230', // darker mud brick
-        brickColorB: '#a07f52', // lighter mud brick
-        mortarColor: '#b6a179', // pale mortar
-        dustColor: '#cbb890', // wind-blown dust
-        brickRough: 0.9,
+        // Fired (baked) brick palette — paler, greyer, buff-pink, not earth ochre.
+        brickColorA: '#9c8a79', // greyish buff
+        brickColorB: '#ccb6a2', // pale buff-pink
+        mortarColor: '#c2b8a8', // pale grey mortar
+        dustColor: '#dacfbe', // pale wind dust
+        brickRough: 0.85,
         mortarRough: 1.0,
 
         // Material-pass tiling targets (used for UV scale, exposed for tuning)
@@ -105,10 +105,33 @@ export default class Malwiya extends THREE.Group {
   //  Small math helpers
   // ------------------------------------------------------------------------
 
-  /** Cone radius at climb-progress t (0 = base, 1 = top). */
-  coneRadius(t) {
+  /** Radius of drum d (0 = bottom, turns-1 = top). Drums step evenly inward. */
+  drumRadius(d) {
     const p = this.params;
-    return THREE.MathUtils.lerp(p.radiusBottom, p.radiusTop, t);
+    const turns = p.rampTurns;
+    if (turns <= 1) return p.radiusBottom;
+    const dd = THREE.MathUtils.clamp(d, 0, turns - 1);
+    return THREE.MathUtils.lerp(p.radiusBottom, p.radiusTop, dd / (turns - 1));
+  }
+
+  /**
+   * Radius the RAMP sits at for climb-progress t. Constant across most of each
+   * revolution (a cylindrical drum wall), then curves inward over the final tenth
+   * of the turn as the ramp passes the setback onto the next, narrower drum.
+   */
+  drumRadiusAtProgress(t) {
+    const turns = this.params.rampTurns;
+    const f = Math.min(t, 0.99999) * turns; // 0..turns
+    const d = Math.floor(f);
+    const frac = f - d; // position within the current drum
+    const blend = THREE.MathUtils.smoothstep(frac, 0.9, 1.0); // round the setback
+    return THREE.MathUtils.lerp(this.drumRadius(d), this.drumRadius(d + 1), blend);
+  }
+
+  /** Ramp half-width at progress t — the ramp narrows slightly as it climbs. */
+  rampHalfWidthAt(t) {
+    const p = this.params;
+    return (p.rampWidth * (1 - p.rampNarrow * t)) / 2;
   }
 
   // ------------------------------------------------------------------------
@@ -167,67 +190,115 @@ export default class Malwiya extends THREE.Group {
   }
 
   // ------------------------------------------------------------------------
-  //  TOWER — manual grid so we control every vertex (courses, slump, pitting)
+  //  TOWER — a stack of cylindrical DRUMS (one per revolution) that step
+  //  inward at each terrace, NOT a smooth cone. The ramp rests on the drums,
+  //  so the silhouette shows distinct horizontal terraces.
   // ------------------------------------------------------------------------
 
   buildTower() {
     const p = this.params;
     const baseTop = p.baseHeight;
     const R = p.towerRadialSegments; // faces around
-    const H = Math.max(2, Math.round(p.towerHeight / p.courseHeight)); // rings up
     const gridW = R + 1; // +1 duplicated seam vertex so UVs don't wrap-tear
+    const turns = p.rampTurns; // one drum per ramp revolution
+    const drumHeight = p.towerHeight / turns;
     const rng = mulberry32(p.seed);
-
-    // Pre-pick which (ring,segment) cells lose a brick — deterministic.
-    const missing = new Set();
-    const candidates = R * H;
-    const count = Math.round(candidates * p.missingBrickChance);
-    for (let i = 0; i < count; i++) {
-      const j = 1 + Math.floor(rng() * (H - 2)); // never the very top/bottom rim
-      const s = Math.floor(rng() * R);
-      missing.add(j * gridW + s);
-    }
+    const bricksAround = Math.max(4, Math.round((2 * Math.PI * p.radiusBottom) / p.brickLength));
 
     const pos = [];
     const uv = []; // channel 0 — per-brick tiling
     const uv1 = []; // channel 1 — MICRO hook, whole-surface 0..1
     const idx = [];
 
-    const bricksAround = Math.max(4, Math.round((2 * Math.PI * p.radiusBottom) / p.brickLength));
+    for (let d = 0; d < turns; d++) {
+      const Rd = this.drumRadius(d);
+      const yBot = baseTop + d * drumHeight;
+      const rings = Math.max(2, Math.round(drumHeight / p.courseHeight));
 
-    for (let j = 0; j <= H; j++) {
-      const t = j / H;
-      const y = baseTop + t * p.towerHeight;
+      // Missing bricks for this drum's wall.
+      const missing = new Set();
+      const count = Math.round(R * rings * p.missingBrickChance);
+      for (let m = 0; m < count; m++) {
+        const jj = 1 + Math.floor(rng() * (rings - 1));
+        const ss = Math.floor(rng() * R);
+        missing.add(jj * gridW + ss);
+      }
 
-      // MESO course banding: alternate courses sit a hair prouder.
-      const course = (j % 2 === 0 ? 1 : -1) * p.courseRelief;
-      // MESO slump: mud bulges outward near the base (rain pools there).
-      const slump = p.slumpAmount * Math.pow(1 - t, 3);
-      // Chamfer the exposed top & bottom rims by tucking them inward.
-      const rimTuck = j === 0 || j === H ? p.edgeChamfer : 0;
+      // --- Drum wall: a straight cylinder at constant radius Rd ------------
+      const wallStart = pos.length / 3;
+      for (let j = 0; j <= rings; j++) {
+        const y = yBot + (j / rings) * drumHeight;
+        const globalT = (y - baseTop) / p.towerHeight;
+        const course = (j % 2 === 0 ? 1 : -1) * p.courseRelief; // MESO bands
+        const slump = p.slumpAmount * Math.pow(1 - globalT, 3); // tiny, base only
+        // Chamfer only the true bottom + true top rims of the whole tower.
+        const isBottom = d === 0 && j === 0;
+        const isTop = d === turns - 1 && j === rings;
+        const rimTuck = isBottom || isTop ? p.edgeChamfer : 0;
 
-      for (let s = 0; s <= R; s++) {
-        const a = (s / R) * Math.PI * 2;
-        let radius = this.coneRadius(t) + course + slump - rimTuck;
+        for (let s = 0; s <= R; s++) {
+          const a = (s / R) * Math.PI * 2;
+          let radius = Rd + course + slump - rimTuck;
+          if (missing.has(j * gridW + s)) radius -= p.brickDepth;
+          pos.push(radius * Math.cos(a), y, radius * Math.sin(a));
+          uv.push((s / R) * bricksAround, y / p.brickHeightTex);
+          uv1.push(s / R, globalT);
+        }
+      }
+      for (let j = 0; j < rings; j++) {
+        for (let s = 0; s < R; s++) {
+          const tl = wallStart + j * gridW + s;
+          const tr = tl + 1;
+          const bl = tl + gridW;
+          const br = bl + 1;
+          idx.push(tl, bl, tr, tr, bl, br); // outward-facing
+        }
+      }
 
-        // Knock this vertex inward if it belongs to a missing-brick cell.
-        if (missing.has(j * gridW + s)) radius -= p.brickDepth;
-
-        pos.push(radius * Math.cos(a), y, radius * Math.sin(a));
-        uv.push((s / R) * bricksAround, (p.towerHeight * t) / p.brickHeightTex);
-        uv1.push(s / R, t);
+      // --- Terrace shelf on top of this drum, stepping in to the next one ---
+      if (d < turns - 1) {
+        const Rin = this.drumRadius(d + 1);
+        const yLedge = yBot + drumHeight;
+        const gT = (yLedge - baseTop) / p.towerHeight;
+        const ledgeStart = pos.length / 3;
+        for (let s = 0; s <= R; s++) {
+          const a = (s / R) * Math.PI * 2; // outer ring at Rd
+          pos.push(Rd * Math.cos(a), yLedge, Rd * Math.sin(a));
+          uv.push((s / R) * bricksAround, yLedge / p.brickHeightTex);
+          uv1.push(s / R, gT);
+        }
+        for (let s = 0; s <= R; s++) {
+          const a = (s / R) * Math.PI * 2; // inner ring at Rin
+          pos.push(Rin * Math.cos(a), yLedge, Rin * Math.sin(a));
+          uv.push((s / R) * bricksAround, yLedge / p.brickHeightTex);
+          uv1.push(s / R, gT);
+        }
+        for (let s = 0; s < R; s++) {
+          const o = ledgeStart + s;
+          const o2 = o + 1;
+          const in1 = ledgeStart + gridW + s;
+          const in2 = in1 + 1;
+          idx.push(o, in1, o2, o2, in1, in2); // upward-facing shelf
+        }
       }
     }
 
-    // Stitch quads. Winding (tl,bl,tr / tr,bl,br) faces outward (verified by
-    // right-hand rule: local up × local tangent points along +radius).
-    for (let j = 0; j < H; j++) {
+    // --- Cap the very top so we never see into the top drum ----------------
+    {
+      const Rtop = this.drumRadius(turns - 1);
+      const yTop = baseTop + p.towerHeight;
+      const capStart = pos.length / 3;
+      pos.push(0, yTop, 0); // centre vertex of the fan
+      uv.push(0, 0);
+      uv1.push(0.5, 1);
+      for (let s = 0; s <= R; s++) {
+        const a = (s / R) * Math.PI * 2;
+        pos.push(Rtop * Math.cos(a), yTop, Rtop * Math.sin(a));
+        uv.push((s / R) * bricksAround, yTop / p.brickHeightTex);
+        uv1.push(s / R, 1);
+      }
       for (let s = 0; s < R; s++) {
-        const tl = j * gridW + s;
-        const tr = tl + 1;
-        const bl = tl + gridW;
-        const br = bl + 1;
-        idx.push(tl, bl, tr, tr, bl, br);
+        idx.push(capStart, capStart + 1 + s + 1, capStart + 1 + s); // upward fan
       }
     }
 
@@ -247,22 +318,18 @@ export default class Malwiya extends THREE.Group {
   buildRamp() {
     const p = this.params;
     const baseTop = p.baseHeight;
-    const halfW = p.rampWidth / 2;
+    const halfW = p.rampWidth / 2; // reference half-width; scaled per step below
     const th = p.rampThickness;
-    const pw = p.parapetThickness;
-    const ph = p.parapetHeight;
 
-    // Cross-section corners in local (u = radial offset, v = vertical).
-    // Walking surface is v=0; slab hangs to v=-th; parapet rises to v=+ph.
+    // Cross-section corners in local (u = radial offset, v = vertical). A plain
+    // slab: NO parapet — the open outer edge is the Malwiya's defining feature.
     const corners = [
-      [-halfW, -th], // inner bottom
-      [-halfW, 0], // inner top (walk surface begins, against the cone)
-      [halfW - pw, 0], // walk surface out to parapet foot
-      [halfW - pw, ph], // up the inner face of the parapet
-      [halfW, ph], // over the parapet top
-      [halfW, -th], // down the outer face
+      [-halfW, -th], // inner bottom (against the drum wall)
+      [-halfW, 0], // inner top
+      [halfW, 0], // outer top — the open edge
+      [halfW, -th], // outer bottom
     ];
-    const prof = chamferProfile(corners, p.edgeChamfer); // -> ~12 rounded pts
+    const prof = chamferProfile(corners, p.edgeChamfer); // -> ~8 rounded pts
     const P = prof.length;
 
     // V coordinate = distance travelled around the profile / brick height.
@@ -288,9 +355,11 @@ export default class Malwiya extends THREE.Group {
     for (let k = 0; k <= M; k++) {
       const t = k / M;
       const theta = p.handedness * 2 * Math.PI * p.rampTurns * t;
-      const cr = this.coneRadius(t);
-      // Inner edge tucks 0.1m INTO the cone so the seam merges (no z-fight gap).
-      const centerR = cr + halfW - 0.1;
+      const dr = this.drumRadiusAtProgress(t); // stepped drum radius under the ramp
+      const hw = this.rampHalfWidthAt(t); // ramp narrows as it climbs
+      const wScale = hw / halfW; // scales the profile's radial coords
+      // Inner edge tucks 0.1m INTO the drum wall so the seam merges (no gap).
+      const centerR = dr + hw - 0.1;
       const yWalk = baseTop + t * p.towerHeight;
 
       // Centreline point, for arc-length UVs.
@@ -304,10 +373,10 @@ export default class Malwiya extends THREE.Group {
       const stepMissing = rng() < p.missingBrickChance;
 
       for (let i = 0; i < P; i++) {
-        let u = prof[i][0];
+        let u = prof[i][0] * wScale; // narrow the ramp as it rises
         const v = prof[i][1];
 
-        // Only weather the OUTER half (u>0). The inner half hides on the cone.
+        // Only weather the OUTER half (u>0). The inner half hides on the drum.
         if (u > 0) {
           u += (rng() - 0.5) * p.courseRelief; // gentle course jitter
           if (stepMissing) u -= p.brickDepth; // recess a knocked-out brick
@@ -463,8 +532,7 @@ export default class Malwiya extends THREE.Group {
     ramp.add(this.params, 'rampTurns', 1, 8, 1).onFinishChange(rebuild);
     ramp.add(this.params, 'rampWidth', 1, 5, 0.1).onFinishChange(rebuild);
     ramp.add(this.params, 'rampThickness', 0.2, 1.5, 0.05).onFinishChange(rebuild);
-    ramp.add(this.params, 'parapetHeight', 0, 2, 0.05).onFinishChange(rebuild);
-    ramp.add(this.params, 'parapetThickness', 0.1, 1, 0.05).onFinishChange(rebuild);
+    ramp.add(this.params, 'rampNarrow', 0, 0.6, 0.02).name('ramp taper').onFinishChange(rebuild);
     ramp.add(this.params, 'segmentsPerTurn', 24, 200, 1).onFinishChange(rebuild);
     ramp.add(this.params, 'handedness', { CCW: -1, CW: 1 }).onFinishChange(rebuild);
     ramp.add(this.params, 'edgeChamfer', 0.02, 0.4, 0.01).onFinishChange(rebuild);
