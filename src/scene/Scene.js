@@ -2,8 +2,11 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import Stats from 'stats.js';
 import GUI from 'lil-gui';
-import Malwiya from './Malwiya.js';
+import MinaretModel from './MinaretModel.js';
+import LoadingOverlay from './LoadingOverlay.js';
 import Environment from './Environment.js';
+// NOTE: Malwiya.js (the original procedural minaret) is kept in the repo for
+// comparison but is no longer imported or rendered — the GLTF model replaces it.
 
 /**
  * Scene owns the three "engine" objects (renderer, camera, clock), the
@@ -89,19 +92,99 @@ export default class Scene {
     this.ground.receiveShadow = true; // catches the spiral shadow
     this.scene.add(this.ground);
 
-    // --- The minaret --------------------------------------------------------
-    // Procedural Malwiya; every dimension is wired into the GUI for tuning.
-    this.minaret = new Malwiya({}, this.gui);
+    // --- The minaret (GLTF model) -------------------------------------------
+    // Loads asynchronously: the group starts EMPTY and fills in when the GLTF
+    // resolves. A LoadingOverlay shows real byte-progress from the download.
+    this.overlay = new LoadingOverlay(this.container);
+    const modelUrl =
+      import.meta.env.BASE_URL + 'models/the_minaret_of_samarra_iraq/scene.gltf';
+    this.minaret = new MinaretModel({
+      url: modelUrl,
+      targetHeight: 52, // metres — the real Malwiya's height
+      mirror: false, // flip to true if the ramp spirals the wrong way (docs/reference)
+      gui: this.gui,
+      onProgress: (f, loaded, total) => this.overlay.setProgress(f, loaded, total),
+      onReady: () => this.onMinaretReady(),
+      onError: (e) => this.overlay.fail(e.message),
+    });
     this.scene.add(this.minaret);
 
     // --- Lighting + sky ------------------------------------------------------
     // Environment owns the sun (sky + all four light sources) and the shadows.
     this.environment = new Environment(this.scene, this.gui);
 
-    // Fit the camera to the finished structure, and give the user a button to
-    // snap back to this framing after they have orbited or zoomed away.
-    this.frameMinaret();
+    // Provisional framing so the empty scene isn't aimed at nothing; the real
+    // fit happens in onMinaretReady() once the tower's true bounds are known.
+    this.controls.target.set(0, 26, 0);
+    this.controls.update();
     this.gui.add({ frame: () => this.frameMinaret() }, 'frame').name('Frame minaret');
+    // Perf tooling for HARD RULE #3 (60fps at 4K). One click renders the scene
+    // at a true 3840x2160 buffer for a few seconds and logs avg/min fps.
+    this.benchmarking = false;
+    this.gui.add({ bench: () => this.benchmark4K() }, 'bench').name('Benchmark 4K (5s)');
+  }
+
+  /** The GLTF has arrived and been restyled — frame it and dismiss the loader. */
+  onMinaretReady() {
+    this.frameMinaret();
+    this.overlay.hide();
+    // Report draw calls once the model is drawn (info is populated after a render).
+    requestAnimationFrame(() => {
+      const info = this.renderer.info.render;
+      console.log(
+        `[Scene] draw calls: ${info.calls} | triangles this frame: ${info.triangles.toLocaleString()} ` +
+          `(colour + shadow passes) | budget: <50 calls`
+      );
+    });
+  }
+
+  /**
+   * Force a real 4K (3840x2160) render for `seconds` and log the sustained fps.
+   * updateStyle=false means the on-screen canvas is untouched — we only change
+   * HOW MANY pixels the GPU shades, which is what the 4K budget is really about.
+   * The main loop pauses (this.benchmarking) so only this loop draws.
+   */
+  benchmark4K(seconds = 5) {
+    if (this.benchmarking) return;
+    if (!this.minaret || this.minaret.children.length === 0) {
+      console.warn('[perf] model not loaded yet — try again once the tower appears');
+      return;
+    }
+    this.benchmarking = true;
+    const prevPR = this.renderer.getPixelRatio();
+    this.renderer.setPixelRatio(1);
+    this.renderer.setSize(3840, 2160, false); // false = don't touch the CSS size
+    this.camera.aspect = 3840 / 2160;
+    this.camera.updateProjectionMatrix();
+
+    let frames = 0;
+    let minFps = Infinity;
+    const start = performance.now();
+    let last = start;
+    const loop = () => {
+      this.controls.update();
+      this.environment.update(this.camera);
+      this.renderer.render(this.scene, this.camera);
+      const now = performance.now();
+      if (frames > 0) minFps = Math.min(minFps, 1000 / (now - last)); // skip warm-up frame
+      last = now;
+      frames++;
+      if (now - start < seconds * 1000) {
+        requestAnimationFrame(loop);
+      } else {
+        const avg = frames / ((now - start) / 1000);
+        const info = this.renderer.info.render;
+        console.log(
+          `[perf] 4K 3840x2160 for ${seconds}s: avg ${avg.toFixed(1)} fps, min ${minFps.toFixed(1)} fps ` +
+            `| draw calls ${info.calls} | triangles ${info.triangles.toLocaleString()}`
+        );
+        // Restore the on-screen resolution and resume the normal loop.
+        this.renderer.setPixelRatio(prevPR);
+        this.onResize();
+        this.benchmarking = false;
+      }
+    };
+    requestAnimationFrame(loop);
   }
 
   /**
@@ -112,6 +195,9 @@ export default class Scene {
    * Runs on startup and from the "Frame minaret" GUI button.
    */
   frameMinaret() {
+    // The model loads asynchronously; do nothing until it actually has geometry.
+    if (!this.minaret || this.minaret.children.length === 0) return;
+
     // Bounding sphere of the minaret ONLY — its centre is ~tower mid-height and
     // (because the ramp wraps symmetrically) horizontally over the origin.
     const box = new THREE.Box3().setFromObject(this.minaret);
@@ -162,6 +248,12 @@ export default class Scene {
 
   /** One frame: measured by Stats, advances controls, draws the scene. */
   tick() {
+    // While the 4K benchmark owns the renderer, skip this loop's draw so the two
+    // render loops don't fight (that would corrupt the fps measurement).
+    if (this.benchmarking) {
+      requestAnimationFrame(this.tick);
+      return;
+    }
     this.stats.begin();
     const delta = this.clock.getDelta(); // seconds since last frame (for later)
     this.controls.update();              // required when damping is on

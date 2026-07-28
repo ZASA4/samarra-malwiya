@@ -1,0 +1,11 @@
+Model Information:
+* title:	The Minaret of Samarra, Iraq
+* source:	https://sketchfab.com/3d-models/the-minaret-of-samarra-iraq-d8ebe7c756f2414bb70768d936f2d137
+* author:	Chenzoss (https://sketchfab.com/Chenzoss)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "The Minaret of Samarra, Iraq" (https://sketchfab.com/3d-models/the-minaret-of-samarra-iraq-d8ebe7c756f2414bb70768d936f2d137) by Chenzoss (https://sketchfab.com/Chenzoss) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
