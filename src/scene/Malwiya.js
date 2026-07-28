@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { createMudBrickMaterial } from '../shaders/mud/MudBrickMaterial.js';
 
 /**
  * Malwiya — the procedural Great Mosque minaret of Samarra (848–852 CE).
@@ -67,6 +68,22 @@ export default class Malwiya extends THREE.Group {
         aoStrength: 0.4, // 0..1, max darkening
         aoContactRange: 8, // m, how far up from the ground the darkening fades
 
+        // Surface — procedural mud-brick material (see MudBrickMaterial.js)
+        weathering: 0.4, // 0..1, dust build-up on upward faces
+        brickTexW: 0.5, // m, brick width in the texture pattern
+        brickTexH: 0.22, // m, course height in the texture pattern
+        mortarWidth: 0.09, // fraction of a brick taken by mortar
+        cavityDark: 0.5, // dirt darkening in the mortar lines
+        edgeWear: 0.5, // brightening/smoothing of worn brick edges
+        grainScale: 6.0, // frequency of the fine grain noise
+        polish: 0.5, // roughness multiplier on trodden (up-facing) surfaces
+        brickColorA: '#6f5230', // darker mud brick
+        brickColorB: '#a07f52', // lighter mud brick
+        mortarColor: '#b6a179', // pale mortar
+        dustColor: '#cbb890', // wind-blown dust
+        brickRough: 0.9,
+        mortarRough: 1.0,
+
         // Material-pass tiling targets (used for UV scale, exposed for tuning)
         brickLength: 0.4, // m, one brick along its length
         brickHeightTex: 0.28, // m, one course tall
@@ -99,6 +116,7 @@ export default class Malwiya extends THREE.Group {
   // ------------------------------------------------------------------------
 
   build() {
+    this.mudMaterials = []; // refreshed each (re)build; filled by the part builders
     this.buildBase();
     this.buildTower();
     this.buildRamp();
@@ -140,7 +158,8 @@ export default class Malwiya extends THREE.Group {
       2, // segments per chamfer (keeps triangle count tiny)
       p.baseChamfer
     );
-    const mat = new THREE.MeshStandardMaterial({ color: 0x9a7b4f, roughness: 0.95 });
+    const mat = createMudBrickMaterial(p, false);
+    this.mudMaterials.push(mat);
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.y = p.baseHeight / 2; // sit its base on the ground (y=0)
     mesh.name = 'base';
@@ -214,10 +233,9 @@ export default class Malwiya extends THREE.Group {
 
     const geo = this.makeGeometry(pos, uv, uv1, idx);
     this.bakeAO(geo); // contact/underside darkening baked into vertex colours
-    const mesh = new THREE.Mesh(
-      geo,
-      new THREE.MeshStandardMaterial({ color: 0xa07f52, roughness: 0.95, vertexColors: true })
-    );
+    const mat = createMudBrickMaterial(this.params, true);
+    this.mudMaterials.push(mat);
+    const mesh = new THREE.Mesh(geo, mat);
     mesh.name = 'tower';
     this.addPart(mesh);
   }
@@ -319,10 +337,9 @@ export default class Malwiya extends THREE.Group {
     ensureOutward(geo);
     this.bakeAO(geo); // darken the underside of the ramp + lowest turns
 
-    const mesh = new THREE.Mesh(
-      geo,
-      new THREE.MeshStandardMaterial({ color: 0x8f7048, roughness: 1.0, vertexColors: true })
-    );
+    const mat = createMudBrickMaterial(this.params, true);
+    this.mudMaterials.push(mat);
+    const mesh = new THREE.Mesh(geo, mat);
     mesh.name = 'ramp';
     this.addPart(mesh);
   }
@@ -352,10 +369,9 @@ export default class Malwiya extends THREE.Group {
     // Lathe gives channel-0 UVs only; copy them into channel 1 as the hook.
     geo.setAttribute('uv1', new THREE.BufferAttribute(geo.attributes.uv.array.slice(), 2));
 
-    const mesh = new THREE.Mesh(
-      geo,
-      new THREE.MeshStandardMaterial({ color: 0xa8865a, roughness: 0.9 })
-    );
+    const mat = createMudBrickMaterial(p, false);
+    this.mudMaterials.push(mat);
+    const mesh = new THREE.Mesh(geo, mat);
     mesh.position.y = p.baseHeight + p.towerHeight; // stand it on the tower top
     mesh.name = 'summit';
     this.addPart(mesh);
@@ -466,6 +482,21 @@ export default class Malwiya extends THREE.Group {
     erosion.add(this.params, 'aoStrength', 0, 1, 0.05).name('AO strength').onFinishChange(rebuild);
     erosion.add(this.params, 'aoContactRange', 1, 20, 0.5).name('AO range').onFinishChange(rebuild);
     erosion.add(this.params, 'seed', 0, 9999, 1).onFinishChange(rebuild);
+
+    // Surface material — most controls update the shader uniforms live (no
+    // rebuild); brick size changes the pattern so those rebuild.
+    const surf = f.addFolder('Surface');
+    const live = (key, uni) => (v) => {
+      for (const m of this.mudMaterials) m.userData.mudUniforms[uni].value = v;
+    };
+    surf.add(this.params, 'weathering', 0, 1, 0.02).onChange(live('weathering', 'uWeathering'));
+    surf.add(this.params, 'cavityDark', 0, 1, 0.02).name('cavity dirt').onChange(live('cavityDark', 'uCavityDark'));
+    surf.add(this.params, 'edgeWear', 0, 1, 0.02).name('edge wear').onChange(live('edgeWear', 'uEdgeWear'));
+    surf.add(this.params, 'polish', 0, 1, 0.02).name('foot polish').onChange(live('polish', 'uPolish'));
+    surf.add(this.params, 'grainScale', 1, 20, 0.5).name('grain scale').onChange(live('grainScale', 'uGrainScale'));
+    surf.add(this.params, 'brickTexW', 0.2, 1.5, 0.05).name('brick width').onFinishChange(rebuild);
+    surf.add(this.params, 'brickTexH', 0.1, 0.6, 0.02).name('course height').onFinishChange(rebuild);
+    surf.add(this.params, 'mortarWidth', 0.02, 0.25, 0.01).name('mortar').onFinishChange(rebuild);
   }
 }
 
