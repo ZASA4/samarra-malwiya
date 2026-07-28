@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import Stats from 'stats.js';
+import GUI from 'lil-gui';
+import Malwiya from './Malwiya.js';
 
 /**
  * Scene owns the three "engine" objects (renderer, camera, clock), the
@@ -49,6 +51,8 @@ export default class Scene {
     // Polar angle is measured from straight up (0) down to straight down (PI).
     // The horizon is PI/2; stopping just short keeps the camera above ground.
     this.controls.maxPolarAngle = Math.PI / 2 - 0.05;
+    // Look at the tower's mid-height, not the ground, so it frames nicely.
+    this.controls.target.set(0, 28, 0);
 
     // --- FPS meter -----------------------------------------------------------
     this.stats = new Stats();
@@ -57,6 +61,9 @@ export default class Scene {
     this.stats.dom.style.top = '0';
     this.stats.dom.style.left = '0';
     this.container.appendChild(this.stats.dom);
+
+    // lil-gui panel — Malwiya registers all its dimension sliders here.
+    this.gui = new GUI();
 
     // Build the visible contents, then wire up resizing.
     this.buildWorld();
@@ -77,14 +84,10 @@ export default class Scene {
     ground.rotation.x = -Math.PI / 2;
     this.scene.add(ground);
 
-    // --- Placeholder for the minaret ----------------------------------------
-    // A tall box centred at the origin, lifted so it sits ON the ground.
-    const box = new THREE.Mesh(
-      new THREE.BoxGeometry(20, 60, 20),
-      new THREE.MeshStandardMaterial({ color: 0x9c7a4d })
-    );
-    box.position.y = 30; // half its height, so its base touches y=0
-    this.scene.add(box);
+    // --- The minaret --------------------------------------------------------
+    // Procedural Malwiya; every dimension is wired into the GUI for tuning.
+    this.minaret = new Malwiya({}, this.gui);
+    this.scene.add(this.minaret);
 
     // --- Lighting ------------------------------------------------------------
     // Ambient: flat fill so nothing is pure black. Directional: the "sun",
