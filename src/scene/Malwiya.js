@@ -62,6 +62,11 @@ export default class Malwiya extends THREE.Group {
         missingBrickChance: 0.02, // 0..1 probability per candidate cell
         brickDepth: 0.18, // m, how deep a missing brick recesses
 
+        // Baked ambient occlusion (MESO) — darkens contact areas so the base
+        // and undersides read as "grounded" without a screen-space AO pass.
+        aoStrength: 0.4, // 0..1, max darkening
+        aoContactRange: 8, // m, how far up from the ground the darkening fades
+
         // Material-pass tiling targets (used for UV scale, exposed for tuning)
         brickLength: 0.4, // m, one brick along its length
         brickHeightTex: 0.28, // m, one course tall
@@ -207,9 +212,11 @@ export default class Malwiya extends THREE.Group {
       }
     }
 
+    const geo = this.makeGeometry(pos, uv, uv1, idx);
+    this.bakeAO(geo); // contact/underside darkening baked into vertex colours
     const mesh = new THREE.Mesh(
-      this.makeGeometry(pos, uv, uv1, idx),
-      new THREE.MeshStandardMaterial({ color: 0xa07f52, roughness: 0.95 })
+      geo,
+      new THREE.MeshStandardMaterial({ color: 0xa07f52, roughness: 0.95, vertexColors: true })
     );
     mesh.name = 'tower';
     this.addPart(mesh);
@@ -310,10 +317,11 @@ export default class Malwiya extends THREE.Group {
     const geo = this.makeGeometry(pos, uv, uv1, idx);
     // Guarantee outward normals: if the tube came out inside-out, flip winding.
     ensureOutward(geo);
+    this.bakeAO(geo); // darken the underside of the ramp + lowest turns
 
     const mesh = new THREE.Mesh(
       geo,
-      new THREE.MeshStandardMaterial({ color: 0x8f7048, roughness: 1.0 })
+      new THREE.MeshStandardMaterial({ color: 0x8f7048, roughness: 1.0, vertexColors: true })
     );
     mesh.name = 'ramp';
     this.addPart(mesh);
@@ -366,6 +374,33 @@ export default class Malwiya extends THREE.Group {
     g.setIndex(idx);
     g.computeVertexNormals(); // smooth normals; chamfers catch the highlights
     return g;
+  }
+
+  /**
+   * Bake a cheap ambient-occlusion term into a vertex-colour attribute: darken
+   * vertices near the ground contact and on downward-facing (under) surfaces.
+   * Static and free at render time — enough to seat the tower in the sand and
+   * shade the ramp's underside without a screen-space AO pass. The mesh material
+   * must set `vertexColors: true` for it to take effect.
+   */
+  bakeAO(geo) {
+    const p = this.params;
+    const posAttr = geo.attributes.position;
+    const nrmAttr = geo.attributes.normal;
+    const n = posAttr.count;
+    const colors = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const y = posAttr.getY(i);
+      const ny = nrmAttr.getY(i);
+      // 1 at the ground contact, fading to 0 by aoContactRange above the base.
+      const contact = 1 - THREE.MathUtils.smoothstep(y - p.baseHeight, 0, p.aoContactRange);
+      const under = Math.max(0, -ny); // down-facing surfaces are more occluded
+      const ao = 1 - p.aoStrength * Math.min(1, Math.max(contact, under * 0.5));
+      colors[i * 3] = ao;
+      colors[i * 3 + 1] = ao;
+      colors[i * 3 + 2] = ao;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   }
 
   computeStats() {
@@ -428,6 +463,8 @@ export default class Malwiya extends THREE.Group {
     erosion.add(this.params, 'slumpAmount', 0, 2, 0.05).onFinishChange(rebuild);
     erosion.add(this.params, 'missingBrickChance', 0, 0.2, 0.005).onFinishChange(rebuild);
     erosion.add(this.params, 'brickDepth', 0, 0.5, 0.02).onFinishChange(rebuild);
+    erosion.add(this.params, 'aoStrength', 0, 1, 0.05).name('AO strength').onFinishChange(rebuild);
+    erosion.add(this.params, 'aoContactRange', 1, 20, 0.5).name('AO range').onFinishChange(rebuild);
     erosion.add(this.params, 'seed', 0, 9999, 1).onFinishChange(rebuild);
   }
 }
