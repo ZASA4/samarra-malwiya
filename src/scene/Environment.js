@@ -26,13 +26,22 @@ export default class Environment {
 
     // Merge the physical atmosphere constants with scene-lighting controls.
     this.params = Object.assign({}, ATMOSPHERE, {
-      timeOfDay: 17.2, // h, low golden hour (sun ~10 deg above horizon)
+      timeOfDay: 17.3, // h, hero golden hour — sun ~8.7 deg elevation (5-12 window)
       latitude: 34.2, // deg N — Samarra, Iraq
       declination: 0, // deg — equinox-ish; +/- shifts the seasonal arc
       sunIntensityScale: 2.6, // DirectionalLight brightness
       hemiIntensity: 0.9, // sky + ground bounce strength
       groundColor: '#b07a3c', // warm ochre sand for the ground bounce
+      // Split-tone: the sky-bounce FILL is pushed to a desaturated slate blue so
+      // shadows read cool while the direct sun stays warm amber (see updateSun).
+      fillColor: '#6c829d',
       sunDistance: 200, // where we park the light for shadow framing
+      shadowThrowCap: 260, // m, how far down-sun we still render the cast shadow
+
+      // Sky contrast (multipliers on the physical model, shared with the lights):
+      rayleigh: 1.9, // deeper blue-indigo overhead
+      mie: 1.7, // denser warm dust glow hugging the horizon near the sun
+      mieG: 0.8, // tighter forward glow around the sun disc
     });
 
     // --- Sky dome -----------------------------------------------------------
@@ -52,6 +61,9 @@ export default class Environment {
     scene.add(this.hemi);
 
     this.focus = { center: new THREE.Vector3(0, 25, 0), radius: 40 };
+    // The shadow frustum is aimed here — recomputed each updateSun() so it hugs
+    // the minaret AND the direction its long shadow is thrown.
+    this.shadow = { center: this.focus.center.clone(), radius: this.focus.radius };
     this.configureShadow();
     this.updateSun();
     if (gui) this.buildGUI(gui);
@@ -70,19 +82,24 @@ export default class Environment {
     this.updateSun();
   }
 
-  /** Big, tight shadow map so the spiral shadow band stays sharp (hero shot). */
+  /**
+   * Big, tight shadow map for the hero shot. The frustum is sized and CENTRED
+   * (see updateSun) to hug the minaret and the reach of its long cast shadow, so
+   * texels aren't wasted on empty desert. PCF-soft + these biases kill both the
+   * stair-stepping and the light-leak you get from a low, grazing sun.
+   */
   configureShadow() {
-    const r = this.focus.radius;
+    const r = this.shadow.radius;
     const cam = this.sun.shadow.camera;
     this.sun.shadow.mapSize.set(4096, 4096); // high res -> crisp edges
-    cam.left = -r * 1.15; // frustum only just larger than the tower...
-    cam.right = r * 1.15; // ...so every shadow texel is spent on the minaret
-    cam.top = r * 1.15;
-    cam.bottom = -r * 1.15;
+    cam.left = -r;
+    cam.right = r;
+    cam.top = r;
+    cam.bottom = -r;
     cam.near = 1;
-    cam.far = this.params.sunDistance + r * 2;
-    this.sun.shadow.bias = -0.0004; // kill shadow acne on the curved tower
-    this.sun.shadow.normalBias = 0.4;
+    cam.far = this.params.sunDistance + r * 2 + this.focus.center.y;
+    this.sun.shadow.bias = -0.0005; // kill shadow acne on the curved tower
+    this.sun.shadow.normalBias = 0.6; // push samples off the surface -> no leaking
     cam.updateProjectionMatrix();
   }
 
@@ -109,15 +126,36 @@ export default class Environment {
     // How high is the sun? Fade the direct light out as it dips below horizon.
     const elevationFactor = THREE.MathUtils.smoothstep(dir.y, -0.05, 0.15);
 
-    // 1. Direct sun: warm colour, brightness scaled by elevation.
+    // --- Shadow framing: tighten the frustum to the minaret AND its cast shadow.
+    // A point of height h throws a shadow of length h/tan(elevation); we cover the
+    // near-to-mid throw (capped) and OFFSET the frustum centre down-sun so texels
+    // land on the shadow instead of empty sand on the far side.
+    const horiz = Math.hypot(dir.x, dir.z) || 1e-4;
+    const towerH = this.focus.center.y * 2; // sphere centre sits ~mid-height
+    const reach = Math.min(this.params.shadowThrowCap, (towerH * horiz) / Math.max(dir.y, 1e-3));
+    const off = reach * 0.5;
+    this.shadow.center.set(
+      this.focus.center.x - (dir.x / horiz) * off, // shadow points opposite the sun
+      this.focus.center.y * 0.5,
+      this.focus.center.z - (dir.z / horiz) * off
+    );
+    this.shadow.radius = off + this.focus.radius * 1.4; // base -> shadow tip, with margin
+    this.configureShadow();
+
+    // 1. Direct sun: warm colour, brightness scaled by elevation. The light and
+    // its shadow camera are aimed at the offset centre — direction is unchanged
+    // (position - target is still dir * distance), only the frustum shifts.
     this.sun.color.copy(sunColor);
     this.sun.intensity = p.sunIntensityScale * elevationFactor;
-    this.sun.position.copy(dir).multiplyScalar(p.sunDistance).add(this.focus.center);
+    this.sun.target.position.copy(this.shadow.center);
+    this.sun.position.copy(dir).multiplyScalar(p.sunDistance).add(this.shadow.center);
 
-    // 2. Sky bounce: hemisphere TOP colour = the sky we just sampled.
+    // 2. Sky bounce (split-tone): the hemisphere TOP fill is pushed to a
+    // desaturated slate blue so shadowed/upward faces read COOL, while the direct
+    // sun above stays warm amber. A touch of the real sky hue is kept.
     this.sky.setSunDiscColor(sunColor);
-    this.hemi.color.copy(skyColor);
-    // 3. Ground bounce: hemisphere BOTTOM stays ochre but tracks daylight.
+    this.hemi.color.set(p.fillColor).lerp(skyColor, 0.2);
+    // 3. Ground bounce: hemisphere BOTTOM stays warm ochre but tracks daylight.
     this.hemi.groundColor.set(p.groundColor).multiplyScalar(0.6 + 0.4 * elevationFactor);
     this.hemi.intensity = p.hemiIntensity;
   }
@@ -136,6 +174,7 @@ export default class Environment {
     f.add(this.params, 'sunIntensityScale', 0, 6, 0.1).name('sun intensity').onChange(onSun);
     f.add(this.params, 'hemiIntensity', 0, 3, 0.05).name('bounce intensity').onChange(onSun);
     f.addColor(this.params, 'groundColor').name('ground bounce').onChange(onSun);
+    f.addColor(this.params, 'fillColor').name('shadow fill (cool)').onChange(onSun);
 
     const sky = f.addFolder('Sky');
     sky.add(this.params, 'rayleigh', 0, 4, 0.05).onChange(onSun);

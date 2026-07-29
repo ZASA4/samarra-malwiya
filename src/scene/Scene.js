@@ -5,6 +5,7 @@ import GUI from 'lil-gui';
 import MinaretModel from './MinaretModel.js';
 import LoadingOverlay from './LoadingOverlay.js';
 import Environment from './Environment.js';
+import DustField from './DustField.js';
 // NOTE: Malwiya.js (the original procedural minaret) is kept in the repo for
 // comparison but is no longer imported or rendered — the GLTF model replaces it.
 
@@ -21,12 +22,17 @@ export default class Scene {
     // --- Renderer ------------------------------------------------------------
     // antialias: smooth edges. Then film-like tone mapping + correct colour
     // space so brightness/colour look right instead of washed out.
+    // NOTE: preserveDrawingBuffer is intentionally NOT set — it carries a
+    // permanent perf cost. The 2x screenshot engine captures in the same tick as
+    // the render instead (see captureScreenshot).
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    // Golden-hour grade: crush muddy whites, recover saturated midtones.
+    this.renderer.toneMappingExposure = 0.82;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    // Soft shadow maps — the helical ramp's spiral shadow is the hero image.
+    // Soft (PCF) shadow maps — the helical ramp's spiral shadow is the hero image.
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFShadowMap; // soft variant is deprecated in r185
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     // Cap pixel ratio at 2: retina screens can report 3, which triples the
     // pixels we shade for almost no visual gain — a big perf win on the M3.
@@ -113,20 +119,36 @@ export default class Scene {
     // Environment owns the sun (sky + all four light sources) and the shadows.
     this.environment = new Environment(this.scene, this.gui);
 
+    // --- Ground dust ---------------------------------------------------------
+    // Low golden-hour haze that glows when it catches the sun (updated in tick).
+    this.dust = new DustField({});
+    this.scene.add(this.dust.points);
+
     // Provisional framing so the empty scene isn't aimed at nothing; the real
-    // fit happens in onMinaretReady() once the tower's true bounds are known.
+    // hero framing happens in onMinaretReady() once the tower's bounds are known.
     this.controls.target.set(0, 26, 0);
     this.controls.update();
+    this.gui.add({ hero: () => this.heroView() }, 'hero').name('Hero shot (view)');
     this.gui.add({ frame: () => this.frameMinaret() }, 'frame').name('Frame minaret');
+    this.gui.add(this.renderer, 'toneMappingExposure', 0.4, 1.5, 0.01).name('exposure');
+    // 2x screenshot engine — captures the current view at double resolution.
+    const shots = this.gui.addFolder('Screenshots (2×)');
+    shots.add({ f: () => this.captureScreenshot('hero_shot.png') }, 'f').name('Save hero_shot.png');
+    shots
+      .add({ f: () => this.captureScreenshot('wide_establishing_shot.png') }, 'f')
+      .name('Save wide_establishing_shot.png');
+    shots
+      .add({ f: () => this.captureScreenshot('brick_material_detail.png') }, 'f')
+      .name('Save brick_material_detail.png');
     // Perf tooling for HARD RULE #3 (60fps at 4K). One click renders the scene
     // at a true 3840x2160 buffer for a few seconds and logs avg/min fps.
     this.benchmarking = false;
     this.gui.add({ bench: () => this.benchmark4K() }, 'bench').name('Benchmark 4K (5s)');
   }
 
-  /** The GLTF has arrived and been restyled — frame it and dismiss the loader. */
+  /** The GLTF has arrived and been restyled — set the hero view and dismiss the loader. */
   onMinaretReady() {
-    this.frameMinaret();
+    this.heroView(); // the default view on page load
     this.overlay.hide();
     // Report draw calls once the model is drawn (info is populated after a render).
     requestAnimationFrame(() => {
@@ -136,6 +158,122 @@ export default class Scene {
           `(colour + shadow passes) | budget: <50 calls`
       );
     });
+  }
+
+  /**
+   * The cinematic hero framing (default on load):
+   *  - rule of thirds: the minaret sits on a vertical third, the opposite side
+   *    left open for the sky gradient and the long raking shadow,
+   *  - the camera sits low and looks UP so the tower feels monumental,
+   *  - the view azimuth swings ~55° off the sun for side-light that reveals the
+   *    ramp and throws the shadow across the open side.
+   * Logs the exact reproducible parameters.
+   */
+  heroView() {
+    if (!this.minaret || this.minaret.children.length === 0) return;
+
+    const box = new THREE.Box3().setFromObject(this.minaret);
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    const center = sphere.center;
+    const radius = sphere.radius;
+
+    // Aim LOW on the tower (lower third) so the camera tilts up.
+    const look = new THREE.Vector3(center.x, radius * 0.55, center.z);
+
+    // Orbit azimuth = sun azimuth minus 55° -> raking side-light, shadow sweeps
+    // toward the open side of the frame.
+    const sun = this.environment.sunDir;
+    const sunAz = Math.atan2(sun.x, -sun.z);
+    const camAz = sunAz - THREE.MathUtils.degToRad(55);
+    const horiz = new THREE.Vector3(Math.sin(camAz), 0, -Math.cos(camAz));
+
+    // Distance: looser than a tight fit so the open side keeps sky + shadow room.
+    const vFov = THREE.MathUtils.degToRad(this.camera.fov);
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
+    const dist = (radius * 2.3) / Math.sin(Math.min(vFov, hFov) / 2);
+
+    // Camera BELOW the look point -> it looks up at the tower.
+    const camPos = new THREE.Vector3().copy(look).addScaledVector(horiz, dist);
+    camPos.y = Math.max(2.5, radius * 0.22);
+
+    // Rule of thirds: shift the LOOK-AT sideways (camera's right vector) by a
+    // sixth of the horizontal FOV so the tower lands on a vertical third.
+    const forward = new THREE.Vector3().subVectors(look, camPos).normalize();
+    const right = new THREE.Vector3().crossVectors(forward, this.camera.up).normalize();
+    const thirdShift = dist * Math.tan(hFov / 6);
+    const target = new THREE.Vector3().copy(look).addScaledVector(right, thirdShift);
+
+    this.camera.position.copy(camPos);
+    this.controls.target.copy(target);
+
+    // near/far from the full scene bounds so nothing clips.
+    const sceneRadius = new THREE.Box3()
+      .setFromObject(this.scene)
+      .getBoundingSphere(new THREE.Sphere()).radius;
+    this.camera.near = 1;
+    this.camera.far = dist + sceneRadius * 2.2;
+    this.camera.updateProjectionMatrix();
+
+    // Aim the sun + shadow system at the minaret (the frustum offset toward the
+    // shadow throw is handled inside Environment).
+    this.environment.focusOn(center, radius);
+    this.controls.update();
+
+    // Exact reproducible hero parameters.
+    const d = this.environment.sunDir;
+    const sunElevation = THREE.MathUtils.radToDeg(Math.asin(d.y));
+    const sunAzimuth = (THREE.MathUtils.radToDeg(Math.atan2(d.x, -d.z)) + 360) % 360;
+    console.log('[HERO SHOT]', {
+      position: this.camera.position,
+      target: this.controls.target,
+      sunElevation,
+      sunAzimuth,
+      timeOfDay: this.environment.params.timeOfDay,
+    });
+  }
+
+  /**
+   * 2x screenshot engine. Raises the pixel ratio to 2x the current one, forces a
+   * synchronous render, and reads the canvas with toDataURL IN THE SAME TICK, then
+   * restores the pixel ratio immediately.
+   *
+   * Why same-tick (not preserveDrawingBuffer, not a RenderTarget): without
+   * preserveDrawingBuffer the drawing buffer is only valid until the browser next
+   * composites; because this whole method runs synchronously inside the click
+   * handler (no await / no rAF between render and toDataURL), the buffer is still
+   * intact. This captures the exact tone-mapped, colour-managed canvas the viewer
+   * sees — a RenderTarget read would bypass that final canvas conversion — and it
+   * costs nothing when we are NOT taking a screenshot.
+   *
+   * @param {string} filename - lands in ~/Downloads (browsers can't pick a dir).
+   */
+  captureScreenshot(filename) {
+    const r = this.renderer;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const prevPR = r.getPixelRatio();
+
+    r.setPixelRatio(prevPR * 2); // 2x current
+    r.setSize(w, h); // reallocate the drawing buffer at the new ratio (CSS size unchanged)
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.environment.update(this.camera); // keep the sky dome on the camera
+    r.render(this.scene, this.camera);
+    const url = r.domElement.toDataURL('image/png'); // same tick — buffer still valid
+
+    // Restore immediately.
+    r.setPixelRatio(prevPR);
+    r.setSize(w, h);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    console.log(`[screenshot] ${filename} @ ${w * prevPR * 2}×${h * prevPR * 2}px -> ~/Downloads`);
   }
 
   /**
@@ -255,9 +393,10 @@ export default class Scene {
       return;
     }
     this.stats.begin();
-    const delta = this.clock.getDelta(); // seconds since last frame (for later)
-    this.controls.update();              // required when damping is on
+    const delta = this.clock.getDelta();  // seconds since last frame
+    this.controls.update();               // required when damping is on
     this.environment.update(this.camera); // keep the sky dome on the camera
+    this.dust.update(delta);              // slow horizontal drift of the haze
     this.renderer.render(this.scene, this.camera);
     this.stats.end();
     // Ask the browser for the next frame — this is our render loop.
