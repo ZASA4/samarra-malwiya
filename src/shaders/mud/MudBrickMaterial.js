@@ -47,6 +47,11 @@ export function createMudBrickMaterial(p, vertexColors = false) {
     uDustColor: { value: lin(p.dustColor) },
     uBrickRough: { value: p.brickRough },
     uMortarRough: { value: p.mortarRough },
+    // Procedural bump: strength of the normal perturbation, and how much the fine
+    // grain contributes to it. This is how we compensate for the photogrammetry
+    // smoothing WITHOUT touching geometry — the surface reads as fired brick.
+    uBumpScale: { value: p.bumpScale ?? 0.7 },
+    uGrainRelief: { value: p.grainRelief ?? 0.15 },
   };
 
   const material = new THREE.MeshStandardMaterial({
@@ -85,6 +90,13 @@ export function createMudBrickMaterial(p, vertexColors = false) {
       '#include <roughnessmap_fragment>',
       'float roughnessFactor = clamp(gMudRough, 0.04, 1.0);'
     );
+    // Perturb the shading normal from our procedural relief height (gBumpH). This
+    // runs AFTER the geometric normal is set up, so it works on the smooth scan
+    // mesh and makes mortar lines / brick faces catch the low sun like real brick.
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <normal_fragment_maps>',
+      '#include <normal_fragment_maps>\n' + BUMP_BLOCK
+    );
   };
 
   // Keep the uniform bag reachable so the GUI can retune it live.
@@ -110,11 +122,14 @@ uniform vec3  uMortarColor;
 uniform vec3  uDustColor;
 uniform float uBrickRough;
 uniform float uMortarRough;
+uniform float uBumpScale;
+uniform float uGrainRelief;
 
 varying vec3 vWorldPos;
 varying vec3 vWorldNrm;
 
 float gMudRough; // shared between the map + roughness injection points
+float gBumpH;    // procedural relief height, shared with the normal-perturb inject
 
 // Cheap hashes for per-brick / per-course randomness.
 float hash12(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
@@ -154,7 +169,7 @@ vec4 brickPattern(vec2 uv){
 // Shade one triplanar plane -> albedo + roughness. The world-space noises
 // (grain, mortarNoise) are identical on every plane, so we compute them ONCE in
 // the caller and pass them in rather than paying for fbm three times.
-void mudPlane(vec2 uv, float grain, float mortarNoise, out vec3 albedo, out float rough){
+void mudPlane(vec2 uv, float grain, float mortarNoise, out vec3 albedo, out float rough, out float height){
   vec4 bp = brickPattern(uv);
   float brickMask = bp.x;
   vec2 cell = bp.yz;
@@ -179,6 +194,10 @@ void mudPlane(vec2 uv, float grain, float mortarNoise, out vec3 albedo, out floa
   rough = mix(uMortarRough, uBrickRough, brickMask);
   rough *= 0.85 + 0.3 * grain;                        // roughness follows the noise
   rough = mix(rough, rough * 0.55, rim * uEdgeWear);  // worn edges are smoother
+
+  // Relief height for bump: bricks stand proud, mortar lines are recessed, and
+  // brick edges bevel down a touch. Sharpened so courses read crisply.
+  height = brickMask * mix(0.65, 1.0, smoothstep(0.0, uMortar * 3.0, edge));
 }
 `;
 
@@ -194,12 +213,14 @@ const MAP_BLOCK = /* glsl */ `
   float grain = fbm(wp * uGrainScale);                 // scale 3: fine grain
   float mortarNoise = fbm(wp * 0.6);
 
-  vec3 aX, aY, aZ; float rX, rY, rZ;
-  mudPlane(wp.zy, grain, mortarNoise, aX, rX);         // plane facing X
-  mudPlane(wp.xz, grain, mortarNoise, aY, rY);         // plane facing Y (up)
-  mudPlane(wp.xy, grain, mortarNoise, aZ, rZ);         // plane facing Z
+  vec3 aX, aY, aZ; float rX, rY, rZ; float hX, hY, hZ;
+  mudPlane(wp.zy, grain, mortarNoise, aX, rX, hX);     // plane facing X
+  mudPlane(wp.xz, grain, mortarNoise, aY, rY, hY);     // plane facing Y (up)
+  mudPlane(wp.xy, grain, mortarNoise, aZ, rZ, hZ);     // plane facing Z
   vec3 mudAlbedo = aX * tw.x + aY * tw.y + aZ * tw.z;
   gMudRough      = rX * tw.x + rY * tw.y + rZ * tw.z;
+  // Blended relief height (drives the normal perturbation in <normal_fragment_maps>).
+  gBumpH = hX * tw.x + hY * tw.y + hZ * tw.z + (grain - 0.5) * uGrainRelief;
 
   // Foot/hand polish: near-horizontal, up-facing surfaces (the ramp tread) are
   // smoothed by centuries of traffic.
@@ -211,4 +232,22 @@ const MAP_BLOCK = /* glsl */ `
   gMudRough = mix(gMudRough, 0.95, dust * 0.7);
 
   diffuseColor.rgb *= mudAlbedo;
+`;
+
+// Injected right after <normal_fragment_maps>. Bump mapping from a procedural
+// height field using screen-space derivatives (Mikkelsen/three's perturbNormalArb):
+// no tangents or texture needed, and it is triplanar-agnostic because gBumpH and
+// vWorldPos are both world-space. This is the "sharper surface" the brief asks for.
+const BUMP_BLOCK = /* glsl */ `
+  {
+    vec3 fdx = dFdx(vWorldPos);
+    vec3 fdy = dFdy(vWorldPos);
+    float dHx = dFdx(gBumpH);
+    float dHy = dFdy(gBumpH);
+    vec3 r1 = cross(fdy, normal);
+    vec3 r2 = cross(normal, fdx);
+    float det = dot(fdx, r1);
+    vec3 grad = sign(det) * (dHx * r1 + dHy * r2);
+    normal = normalize(abs(det) * normal - uBumpScale * grad);
+  }
 `;

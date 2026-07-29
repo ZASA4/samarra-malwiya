@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { createMudBrickMaterial } from '../shaders/mud/MudBrickMaterial.js';
+import { buildSummitPavilion } from './SummitPavilion.js';
 
 /**
  * MinaretModel — loads the Sketchfab "Minaret of Samarra" GLTF and turns it into
@@ -79,6 +80,22 @@ export default class MinaretModel extends THREE.Group {
       dustColor: '#dccaa4', // pale warm dust
       brickRough: 0.82,
       mortarRough: 0.95,
+
+      // Material relief: procedural bump in the shader. We do NOT sharpen the
+      // scan geometry; we compensate here so the surface reads as fired brick.
+      bumpScale: 0.7,
+      grainRelief: 0.15,
+
+      // Summit pavilion — the procedural open, blind-arch-niched crown that
+      // replaces the GLTF's scan blob (see SummitPavilion.js and docs/reference).
+      artifactZone: 1.6, // m: the scan blob occupies the top ~1.6 m of the raw mesh
+      pavHeight: 4.0,
+      pavWallThickness: 0.55,
+      pavNiches: 12,
+      pavNicheDepth: 0.32,
+      pavRadialSegs: 96,
+      pavHeightSegs: 32,
+      pavRadiusScale: 0.98, // sit just inside the drum so it reads as stepped-in
     };
 
     this.meshes = [];
@@ -214,6 +231,7 @@ export default class MinaretModel extends THREE.Group {
     // coordinates equal the geometry's metres — critical for the brick shader.
     for (const src of meshes) {
       const geo = src.geometry;
+      this._clipSummitArtifact(geo); // remove the scan blob before we finalise
       geo.computeVertexNormals(); // consistent normals after all the baking
       this._bakeContactAO(geo);
 
@@ -231,6 +249,9 @@ export default class MinaretModel extends THREE.Group {
       this.add(mesh);
       this.meshes.push(mesh);
     }
+
+    // Replace the clipped summit with the authentic open, niched pavilion.
+    this._buildPavilion();
 
     // --- AFTER bounding box (scaled + seated) -------------------------------
     const boxAfter = new THREE.Box3().setFromObject(this);
@@ -270,6 +291,87 @@ export default class MinaretModel extends THREE.Group {
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   }
 
+  /**
+   * Remove the scan artifact ("blob") that the GLTF ships baked into its single
+   * mesh above the summit. Diagnosed as a self-contained connected component in
+   * the top ~1.6 m: at that cut height NO triangle bridges it to the drum's cap,
+   * so deleting its triangles cannot leave a hole. Radially compact (guarded by
+   * maxR) so the wide cap disc below is never touched.
+   */
+  _clipSummitArtifact(geo) {
+    const pos = geo.attributes.position;
+    geo.computeBoundingBox();
+    const clipY = geo.boundingBox.max.y - this.params.artifactZone; // top ~1.6 m
+    const maxR = 2.6; // the blob is < 0.7 m; cap parts near this height are wider
+    const above = (i) => pos.getY(i) > clipY;
+    const near = (i) => Math.hypot(pos.getX(i), pos.getZ(i)) < maxR;
+
+    const src = geo.index.array;
+    const kept = [];
+    let removed = 0;
+    for (let t = 0; t < src.length; t += 3) {
+      const a = src[t], b = src[t + 1], c = src[t + 2];
+      // Remove only triangles fully inside the artifact zone (no bridging tris).
+      if (above(a) && above(b) && above(c) && near(a) && near(b) && near(c)) {
+        removed++;
+        continue;
+      }
+      kept.push(a, b, c);
+    }
+    geo.setIndex(kept);
+    geo.computeBoundingBox();
+    console.log(
+      `[MinaretModel] clipped summit blob: removed ${removed} tris above ` +
+        `y=${clipY.toFixed(1)} m; tower now tops out at y=${geo.boundingBox.max.y.toFixed(2)} m`
+    );
+  }
+
+  /**
+   * Build the procedural open, blind-arch-niched pavilion and seat it on the
+   * clipped tower top, matching docs/reference (samarra-05, samarra-10).
+   */
+  _buildPavilion() {
+    const p = this.params;
+    const main = this.meshes[0];
+    const g = main.geometry;
+    g.computeBoundingBox();
+    const summitY = g.boundingBox.max.y;
+
+    // Outer radius = the drum's radius just below the cap.
+    const pos = g.attributes.position;
+    let summitR = 0;
+    for (let i = 0; i < pos.count; i++) {
+      if (pos.getY(i) > summitY - 1.2) {
+        summitR = Math.max(summitR, Math.hypot(pos.getX(i), pos.getZ(i)));
+      }
+    }
+
+    const mat = createMudBrickMaterial(p, true /* vertexColors */);
+    mat.side = THREE.DoubleSide;
+    mat.shadowSide = THREE.FrontSide;
+    this.materials.push(mat);
+
+    const pavilion = buildSummitPavilion(
+      {
+        baseY: summitY - 0.2, // overlap the cap slightly so there's no gap
+        outerRadius: summitR * p.pavRadiusScale,
+        wallThickness: p.pavWallThickness,
+        height: p.pavHeight,
+        nicheCount: p.pavNiches,
+        nicheDepth: p.pavNicheDepth,
+        radialSegments: p.pavRadialSegs,
+        heightSegments: p.pavHeightSegs,
+      },
+      mat
+    );
+    this.add(pavilion);
+    this.meshes.push(pavilion);
+    console.log(
+      `[MinaretModel] built summit pavilion: r=${(summitR * p.pavRadiusScale).toFixed(2)} m, ` +
+        `h=${p.pavHeight} m, ${p.pavNiches} niches, base y=${(summitY - 0.2).toFixed(2)} m`
+    );
+  }
+
   // ------------------------------------------------------------------------
   //  Stats + GUI
   // ------------------------------------------------------------------------
@@ -305,6 +407,9 @@ export default class MinaretModel extends THREE.Group {
     f.add(this.params, 'cavityDark', 0, 1, 0.02).name('cavity dirt').onChange(live('uCavityDark'));
     f.add(this.params, 'edgeWear', 0, 1, 0.02).name('edge wear').onChange(live('uEdgeWear'));
     f.add(this.params, 'polish', 0, 1, 0.02).name('foot polish').onChange(live('uPolish'));
+    // Procedural relief that compensates the photogrammetry smoothing.
+    f.add(this.params, 'bumpScale', 0, 2, 0.05).name('brick relief').onChange(live('uBumpScale'));
+    f.add(this.params, 'grainRelief', 0, 0.5, 0.01).name('grain relief').onChange(live('uGrainRelief'));
   }
 }
 

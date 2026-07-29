@@ -24,8 +24,13 @@ below), used **for its FORM only**. On load the app:
 - rescales it so the tower is exactly **52 m** tall and seats its base on the
   terrain (no floating, no sinking);
 - applies our own **procedural fired-brick material** — triplanar mapping, brick
-  courses, cavity dirt, edge wear and weathering — evaluated in world space, so
-  the surface is entirely ours, not the model's baked textures.
+  courses, cavity dirt, edge wear, weathering and a procedural **normal-relief
+  bump** (which compensates the scan's smoothing so the surface reads as fired
+  brick, without altering the geometry) — evaluated in world space, so the
+  surface is entirely ours, not the model's baked textures;
+- **clips a scan artifact** the model shipped baked into its mesh above the
+  summit, and rebuilds the crown as a procedural **open, blind-arch-niched
+  pavilion** (`src/scene/SummitPavilion.js`) matching `docs/reference/`.
 
 The original hand-built procedural minaret lives in `src/scene/Malwiya.js`; it is
 kept for comparison but is no longer rendered.
@@ -46,6 +51,7 @@ Attribution, as required by the licence:
 > (http://creativecommons.org/licenses/by/4.0/)
 
 **Changes made to the model:** its baked materials/textures were removed and
-replaced with our own procedural fired-brick shader, and the model was rescaled
-(to 52 m) and re-seated on the ground. CC BY 4.0 permits these modifications and
-commercial use with attribution.
+replaced with our own procedural fired-brick shader; the scanned tower was
+rescaled (to 52 m) and re-seated on the ground; a scan artifact above the summit
+was clipped and the crown was rebuilt as a procedural open, niched pavilion. CC
+BY 4.0 permits these modifications and commercial use with attribution.
